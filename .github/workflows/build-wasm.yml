@@ -1,0 +1,49 @@
+# Builds the game's two WebAssembly modules (`npm run wasm`) on GitHub's servers, so a local checkout only
+# needs Node: download the "wasm-<commit>" artifact from the run and unzip it into trainworld/app/src/wasm/.
+# The artifact must come from the same commit as the local checkout, or the page's bindings will not match.
+name: build-wasm
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "trainworld/sim/**"
+      - "trainworld/app/package.json"
+      - ".github/workflows/build-wasm.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  wasm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: trainworld/sim
+
+      - name: Install wasm-pack 0.15
+        run: cargo install wasm-pack --version "~0.15" --locked
+
+      - name: Build the wasm modules
+        working-directory: trainworld/app
+        run: npm run wasm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-${{ github.sha }}
+          path: trainworld/app/src/wasm/
+          if-no-files-found: error
+          retention-days: 30
