@@ -1,6 +1,7 @@
 import { copyFileSync, createReadStream, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import { execSync } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin } from "vite";
 
@@ -173,41 +174,99 @@ function buildStamp(): Plugin {
 
 /**
  * trainsworld public copy: the game's data (city packs, terrain, outlines, real networks) is 6 GB and is not in git.
- * With no local `data/packs` folder, the dev server answers every `/packs/...` and `/noritetsu/...` request itself
- * by fetching the published copy from data.anita.garden (a server-to-server fetch, so the bucket's CORS never
- * applies). Only the files the game asks for are fetched, so a first session downloads tens of MB.
+ * With no local `data/packs` folder, the dev server answers every `/packs/...` and `/noritetsu/...` request itself.
+ *
+ * Local mirror (this fork): each request is first looked up in `data/mirror/`, laid out exactly like the published
+ * bucket (`data/mirror/trainworld/<version>/...`, `data/mirror/trainworld/terrain-world/v2/...`,
+ * `data/mirror/noritetsu/...`). `tools/mirror-data.mjs` fills it with the whole published copy. A file that is not
+ * there yet is fetched whole from data.anita.garden, saved into the mirror, then served from it, so anything the
+ * game asks for while online is kept for later.
  *   TW_DATA_VERSION=<folder>   which published data version (default: data-version.txt beside this repo's trainworld/)
- *   TW_DATA=off                never fetch; use local data/ only
+ *   TW_MIRROR=<dir>            another mirror folder (default: data/mirror)
+ *   TW_DATA=off                never fetch; serve the mirror only (a missing file is a 404)
  * With a local `data/packs` (or TW_PACKS) this does nothing.
  */
 function dataFallback(): Plugin {
   const ORIGIN = "https://data.anita.garden";
   const versionFile = resolve(here, "../data-version.txt");
   const version = process.env.TW_DATA_VERSION || (existsSync(versionFile) ? readFileSync(versionFile, "utf8").trim() : "");
-  const on = process.env.TW_DATA !== "off" && !!version && !existsSync(PACKS);
-  // fetch has already undone a gzip Content-Encoding, so that header and the length are not passed on
-  const KEEP = ["content-type", "content-range", "accept-ranges", "cache-control", "etag"];
+  const MIRROR = process.env.TW_MIRROR ? resolve(process.env.TW_MIRROR) : resolve(here, "../data/mirror");
+  const online = process.env.TW_DATA !== "off";
+  const on = !!version && !existsSync(PACKS);
+  /** one download per file, shared by the requests that arrive while it runs */
+  const pending = new Map<string, Promise<number>>();
+
+  /** Fetch the whole file into the mirror (a .part renamed over it, so a cut download never looks finished);
+   * resolves to the HTTP status, 200 when the file is now in the mirror. */
+  function download(remote: string, file: string): Promise<number> {
+    let p = pending.get(file);
+    if (!p) {
+      p = (async () => {
+        const r = await fetch(`${ORIGIN}/${remote}`);
+        if (r.status !== 200) return r.status;
+        const body = Buffer.from(await r.arrayBuffer());
+        await mkdir(dirname(file), { recursive: true });
+        const part = `${file}.${process.pid}.part`;
+        await writeFile(part, body);
+        await rename(part, file);
+        return 200;
+      })().finally(() => pending.delete(file));
+      pending.set(file, p);
+    }
+    return p;
+  }
+
+  function serve(file: string, req: any, res: any): void {
+    const size = statSync(file).size;
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Content-Type", file.endsWith(".geojson") ? "application/geo+json" : file.endsWith(".json") ? "application/json" : "application/octet-stream");
+    const range = /bytes=(\d+)-(\d*)/.exec(req.headers.range ?? "");
+    if (range && Number(range[1]) < size) {
+      const a = Number(range[1]), b = range[2] ? Math.min(Number(range[2]), size - 1) : size - 1;
+      res.statusCode = 206;
+      res.setHeader("Content-Range", `bytes ${a}-${b}/${size}`);
+      res.setHeader("Content-Length", b - a + 1);
+      createReadStream(file, { start: a, end: b }).pipe(res);
+    } else {
+      res.setHeader("Content-Length", size);
+      createReadStream(file).pipe(res);
+    }
+  }
+
   return {
     name: "trainsworld-data-fallback",
     configureServer(server) {
       if (!on) return;
-      console.log(`[data] no local data/packs: fetching the game's data from ${ORIGIN}/trainworld/${version}/ as the page asks`);
+      console.log(`[data] data version ${version}: serving ${MIRROR}${online ? `, fetching what is missing from ${ORIGIN} and keeping it` : " only (TW_DATA=off)"}`);
       server.middlewares.use(async (req: any, res: any, next: () => void) => {
-        const url: string = req.url ?? "";
-        let target: string;
-        if (url.startsWith("/packs/terrain-world/")) target = `${ORIGIN}/trainworld/terrain-world/v2/${url.slice("/packs/terrain-world/".length)}`;
-        else if (url.startsWith("/packs/")) target = `${ORIGIN}/trainworld/${version}/${url.slice("/packs/".length)}`;
-        else if (url.startsWith("/noritetsu/")) target = `${ORIGIN}${url}`;
-        else return next();
+        let url: string;
         try {
-          const headers: Record<string, string> = {};
-          if (req.headers.range) headers.range = req.headers.range;
-          const r = await fetch(target, { headers });
-          res.statusCode = r.status;
-          for (const k of KEEP) { const v = r.headers.get(k); if (v) res.setHeader(k, v); }
-          const body = Buffer.from(await r.arrayBuffer());
-          res.setHeader("content-length", body.length);
-          res.end(body);
+          url = decodeURIComponent((req.url ?? "").split("?")[0]);
+        } catch {
+          return next();
+        }
+        let remote: string;
+        if (url.startsWith("/packs/terrain-world/")) remote = `trainworld/terrain-world/v2/${url.slice("/packs/terrain-world/".length)}`;
+        else if (url.startsWith("/packs/")) remote = `trainworld/${version}/${url.slice("/packs/".length)}`;
+        else if (url.startsWith("/noritetsu/")) remote = url.slice(1);
+        else return next();
+        const file = resolve(MIRROR, remote);
+        // nothing outside the mirror, and no folder listings
+        if (!file.startsWith(MIRROR + sep) || remote.endsWith("/")) {
+          res.statusCode = 404;
+          res.end();
+          return;
+        }
+        try {
+          if (!(existsSync(file) && statSync(file).isFile())) {
+            const status = online ? await download(remote, file) : 404;
+            if (status !== 200) {
+              res.statusCode = status;
+              res.end();
+              return;
+            }
+          }
+          serve(file, req, res);
         } catch {
           res.statusCode = 502;
           res.end();
